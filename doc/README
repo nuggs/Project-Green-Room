@@ -1,0 +1,22 @@
+SocketMud
+
+Little mud project, which has a command interpreter and supports
+ANSI colors... has a nifty little help file system, and a few
+commands (say, quit, who, etc). Also supports MCCP version 1 and 2.
+
+I have used a few snippets of Erwin Andreasen's, so if you use this
+codebase for something, remember to keep the credits to him, he
+deserves it.
+
+Simply type 'make' in the ../src/ directory, and start the mud
+by typing './SocketMud &'. You can now connect by telnetting
+to port 9009 on localhost (or whatever machine it runs on).
+
+All parts of the SocketMud code written by me, that is contained
+in this distribution, is considered public domain, and may be used
+as you see fit - but do remember to give credit for Erwin's codebits,
+even though they are considered PD as well.
+
+Code and all that by
+
+Brian Graversen (jobo@daimi.au.dk)
