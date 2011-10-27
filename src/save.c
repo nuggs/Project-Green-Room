@@ -9,32 +9,30 @@
 
 void save_pfile           ( D_MOBILE *dMob );
 void save_profile         ( D_MOBILE *dMob );
-void save_whois           ( D_MOBILE *dMob );
 
 void save_player(D_MOBILE *dMob)
 {
   if (!dMob) return;
 
-  save_pfile(dMob);      /* saves the actual player data         */
-  save_profile(dMob);    /* saves the players profile            */
-  save_whois(dMob);      /* saves the whois data for that player */
+  save_pfile(dMob);      /* saves the actual player data */
+  save_profile(dMob);    /* saves the players profile    */
 }
 
 void save_pfile(D_MOBILE *dMob)
 {
-  char pName[20];
-  char pfile[256];
+  char pName[MAX_BUFFER];
+  char pfile[MAX_BUFFER];
   FILE *fp;
   int size, i;
 
   pName[0] = toupper(dMob->name[0]);
   size = strlen(dMob->name);
-  for (i = 1; i < size; i++)
+  for (i = 1; i < size && i < MAX_BUFFER - 1; i++)
     pName[i] = tolower(dMob->name[i]);
   pName[i] = '\0';
 
   /* open the pfile so we can write to it */
-  sprintf(pfile, "../players/%s.pfile", pName);
+  snprintf(pfile, MAX_BUFFER, "../players/%s.pfile", pName);
   if ((fp = fopen(pfile, "w")) == NULL)
   {
     bug("Unable to write to %s's pfile", dMob->name);
@@ -55,25 +53,25 @@ D_MOBILE *load_player(char *player)
 {
   FILE *fp;
   D_MOBILE *dMob = NULL;
-  char pfile[256];
-  char pName[20];
+  char pfile[MAX_BUFFER];
+  char pName[MAX_BUFFER];
   char *word;
   bool done = FALSE, found;
   int i, size;
 
   pName[0] = toupper(player[0]);
   size = strlen(player);
-  for (i = 1; i < size; i++)
+  for (i = 1; i < size && i < MAX_BUFFER - 1; i++)
     pName[i] = tolower(player[i]);
   pName[i] = '\0';
 
   /* open the pfile so we can write to it */
-  sprintf(pfile, "../players/%s.pfile", pName);     
+  snprintf(pfile, MAX_BUFFER, "../players/%s.pfile", pName);     
   if ((fp = fopen(pfile, "r")) == NULL)
     return NULL;
 
   /* create new mobile data */
-  if (dmobile_free == NULL)
+  if (StackSize(dmobile_free) <= 0)
   {
     if ((dMob = malloc(sizeof(*dMob))) == NULL)
     {
@@ -83,8 +81,7 @@ D_MOBILE *load_player(char *player)
   }
   else
   {
-    dMob         = dmobile_free;
-    dmobile_free = dmobile_free->next;
+    dMob = (D_MOBILE *) PopStack(dmobile_free);
   }
   clear_mobile(dMob);
 
@@ -96,7 +93,7 @@ D_MOBILE *load_player(char *player)
     switch (word[0])
     {
       case 'E':
-        if (compares(word, "EOF")) {done = TRUE; found = TRUE; break;}
+        if (!strcasecmp(word, "EOF")) {done = TRUE; found = TRUE; break;}
         break;
       case 'L':
         IREAD( "Level",     dMob->level     );
@@ -132,25 +129,25 @@ D_MOBILE *load_profile(char *player)
 {
   FILE *fp;
   D_MOBILE *dMob = NULL;
-  char pfile[256];
-  char pName[20];
+  char pfile[MAX_BUFFER];
+  char pName[MAX_BUFFER];
   char *word;
   bool done = FALSE, found;
   int i, size;
 
   pName[0] = toupper(player[0]);
   size = strlen(player);
-  for (i = 1; i < size; i++)
+  for (i = 1; i < size && i < MAX_BUFFER - 1; i++)
     pName[i] = tolower(player[i]);
   pName[i] = '\0';
 
   /* open the pfile so we can write to it */
-  sprintf(pfile, "../players/%s.profile", pName);
+  snprintf(pfile, MAX_BUFFER, "../players/%s.profile", pName);
   if ((fp = fopen(pfile, "r")) == NULL)
     return NULL;
 
   /* create new mobile data */
-  if (dmobile_free == NULL)
+  if (StackSize(dmobile_free) <= 0)
   {
     if ((dMob = malloc(sizeof(*dMob))) == NULL)
     {
@@ -160,8 +157,7 @@ D_MOBILE *load_profile(char *player)
   }
   else
   {
-    dMob         = dmobile_free;
-    dmobile_free = dmobile_free->next;
+    dMob = (D_MOBILE *) PopStack(dmobile_free);
   }
   clear_mobile(dMob);
 
@@ -173,7 +169,7 @@ D_MOBILE *load_profile(char *player)
     switch (word[0])
     {
       case 'E':
-        if (compares(word, "EOF")) {done = TRUE; found = TRUE; break;}
+        if (!strcasecmp(word, "EOF")) {done = TRUE; found = TRUE; break;}
         break;
       case 'N':
         SREAD( "Name",      dMob->name      );
@@ -205,19 +201,19 @@ D_MOBILE *load_profile(char *player)
  */
 void save_profile(D_MOBILE *dMob)
 {
-  char pfile[256];
-  char pName[20];
+  char pfile[MAX_BUFFER];
+  char pName[MAX_BUFFER];
   FILE *fp;
   int size, i;
   
   pName[0] = toupper(dMob->name[0]);
   size = strlen(dMob->name);
-  for (i = 1; i < size; i++)
+  for (i = 1; i < size && i < MAX_BUFFER - 1; i++)
     pName[i] = tolower(dMob->name[i]);
   pName[i] = '\0';
   
   /* open the pfile so we can write to it */
-  sprintf(pfile, "../players/%s.profile", pName);
+  snprintf(pfile, MAX_BUFFER, "../players/%s.profile", pName);
   if ((fp = fopen(pfile, "w")) == NULL)
   {
     bug("Unable to write to %s's pfile", dMob->name);
@@ -231,8 +227,4 @@ void save_profile(D_MOBILE *dMob)
   /* terminate the file */
   fprintf(fp, "%s\n", FILE_TERMINATOR);
   fclose(fp);
-}
-
-void save_whois(D_MOBILE *dMob)
-{
 }

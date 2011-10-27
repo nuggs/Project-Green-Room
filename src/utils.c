@@ -32,85 +32,69 @@ bool check_name(const char *name)
 
 void clear_mobile(D_MOBILE *dMob)
 {
-  static D_MOBILE clear_mobile;
+  memset(dMob, 0, sizeof(*dMob));
 
-  *dMob            =  clear_mobile;
-  dMob->name       =  NULL;
-  dMob->password   =  NULL;
-  dMob->level      =  LEVEL_PLAYER;
+  dMob->name         =  NULL;
+  dMob->password     =  NULL;
+  dMob->level        =  LEVEL_PLAYER;
+  dMob->events       =  AllocList();
 }
 
 void free_mobile(D_MOBILE *dMob)
 {
-  D_MOBILE *xMob;
+  EVENT_DATA *pEvent;
+  ITERATOR Iter;
 
-  if (dMob == dmobile_list)
-    dmobile_list = dMob->next;
-  else
-  {
-    for (xMob = dmobile_list; xMob && xMob->next != dMob; xMob = xMob->next)
-      ;
+  DetachFromList(dMob, dmobile_list);
 
-    if (xMob == NULL)
-    {
-      bug("Free_mobile: Mobile not found.");
-      return;
-    }
-    xMob->next = dMob->next;
-  }
+  if (dMob->socket) dMob->socket->player = NULL;
 
-  /* reset the socket */
-  if (dMob->socket)
-    dMob->socket->player = NULL;
+  AttachIterator(&Iter, dMob->events);
+  while ((pEvent = (EVENT_DATA *) NextInList(&Iter)) != NULL)
+    dequeue_event(pEvent);
+  DetachIterator(&Iter);
+  FreeList(dMob->events);
 
-  ex_free_mob(dMob);
-}
-
-void ex_free_mob(D_MOBILE * dMob)
-{
-  /*
-   * clear out all strings,
-   * remember NULL strings are OK.
-   */
+  /* free allocated memory */
   free(dMob->name);
   free(dMob->password);
 
-  /* put it back in the free list */
-  dMob->next   = dmobile_free;
-  dmobile_free = dMob;
+  PushStack(dMob, dmobile_free);
 }
 
 void communicate(D_MOBILE *dMob, char *txt, int range)
 {
   D_MOBILE *xMob;
+  ITERATOR Iter;
   char buf[MAX_BUFFER];
   char message[MAX_BUFFER];
-
-  /* capitalize leading letter */
-  txt[0] = toupper(txt[0]);
 
   switch(range)
   {
     default:
       bug("Communicate: Bad Range %d.", range);
       return;
-    case COMM_LOCAL:  // everyone is in the same room for now...
-      sprintf(message, "%s says '%s'.\n\r", dMob->name, txt);
-      sprintf(buf, "You say '%s'.\n\r", txt);
+    case COMM_LOCAL:  /* everyone is in the same room for now... */
+      snprintf(message, MAX_BUFFER, "%s says '%s'.\n\r", dMob->name, txt);
+      snprintf(buf, MAX_BUFFER, "You say '%s'.\n\r", txt);
       text_to_mobile(dMob, buf);
-      for (xMob = dmobile_list; xMob; xMob = xMob->next)
+      AttachIterator(&Iter, dmobile_list);
+      while ((xMob = (D_MOBILE *) NextInList(&Iter)) != NULL)
       {
         if (xMob == dMob) continue;
         text_to_mobile(xMob, message);
       }
+      DetachIterator(&Iter);
       break;
     case COMM_LOG:
-      sprintf(message, "[LOG: %s]\n\r", txt);
-      for (xMob = dmobile_list; xMob; xMob = xMob->next)
+      snprintf(message, MAX_BUFFER, "[LOG: %s]\n\r", txt);
+      AttachIterator(&Iter, dmobile_list);
+      while ((xMob = (D_MOBILE *) NextInList(&Iter)) != NULL)
       {
         if (!IS_ADMIN(xMob)) continue;
         text_to_mobile(xMob, message);
       }
+      DetachIterator(&Iter);
       break;
   }
 }
@@ -147,16 +131,15 @@ void copyover_recover()
   D_MOBILE *dMob;
   D_SOCKET *dsock;
   FILE *fp;
-  unsigned char telopt;
   char name [100];
   char host[MAX_BUFFER];
   int desc;
       
-  log("Copyover recovery initiated");
+  log_string("Copyover recovery initiated");
    
   if ((fp = fopen(COPYOVER_FILE, "r")) == NULL)
   {  
-    log("Copyover file not found. Exitting.");
+    log_string("Copyover file not found. Exitting.");
     exit (1);
   }
       
@@ -165,7 +148,7 @@ void copyover_recover()
     
   for (;;)
   {  
-    fscanf(fp, "%d %s %s %c\n", &desc, name, host, &telopt);
+    fscanf(fp, "%d %s %s\n", &desc, name, host);
     if (desc == -1)
       break;
 
@@ -173,13 +156,8 @@ void copyover_recover()
     clear_socket(dsock, desc);
   
     dsock->hostname     =  strdup(host);
-    dsock->next         =  dsock_list;
-    dsock_list          =  dsock;
+    AttachToList(dsock, dsock_list);
  
-    /* re-enable compression if it was enabled before */
-    if (telopt == TELOPT_COMPRESS || telopt == TELOPT_COMPRESS2)
-      compressStart(dsock, telopt);
-
     /* load player data */
     if ((dMob = load_player(name)) != NULL)
     {
@@ -188,8 +166,10 @@ void copyover_recover()
       dsock->player    =  dMob;
   
       /* attach to mobile list */
-      dMob->next       =  dmobile_list;
-      dmobile_list     =  dMob;  
+      AttachToList(dMob, dmobile_list);
+
+      /* initialize events on the player */
+      init_events_player(dMob);
     }
     else /* ah bugger */
     {
@@ -208,6 +188,10 @@ void copyover_recover()
     dsock->bust_prompt    =  TRUE;
     dsock->lookup_status  =  TSTATE_DONE;
     dsock->state          =  STATE_PLAYING;
+
+    /* negotiate compression */
+    text_to_buffer(dsock, (char *) compress_will2);
+    text_to_buffer(dsock, (char *) compress_will);
   }
   fclose(fp);
 }     
@@ -215,15 +199,20 @@ void copyover_recover()
 D_MOBILE *check_reconnect(char *player)
 {
   D_MOBILE *dMob;
+  ITERATOR Iter;
 
-  for (dMob = dmobile_list; dMob; dMob = dMob->next)
+  AttachIterator(&Iter, dmobile_list);
+  while ((dMob = (D_MOBILE *) NextInList(&Iter)) != NULL)
   {
-    if (compares(dMob->name, player))
+    if (!strcasecmp(dMob->name, player))
     {
       if (dMob->socket)
         close_socket(dMob->socket, TRUE);
-      return dMob;
+
+      break;
     }
   }
-  return NULL;
+  DetachIterator(&Iter);
+
+  return dMob;
 }

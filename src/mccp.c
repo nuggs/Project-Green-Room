@@ -89,22 +89,26 @@ bool compressStart(D_SOCKET *dsock, unsigned char teleopt)
 }
 
 /* Cleanly shut down compression on `desc' */
-bool compressEnd(D_SOCKET *dsock)
+bool compressEnd(D_SOCKET *dsock, unsigned char teleopt, bool forced)
 {
   unsigned char dummy[1];
 
   if (!dsock->out_compress)
     return TRUE;
 
+  if (dsock->compressing != teleopt)
+    return FALSE;
+
   dsock->out_compress->avail_in = 0;
-  dsock->out_compress->next_in  = dummy;
+  dsock->out_compress->next_in = dummy;
+  dsock->top_output = 0;
 
   /* No terminating signature is needed - receiver will get Z_STREAM_END */
-  if (deflate(dsock->out_compress, Z_FINISH) != Z_STREAM_END)
+  if (deflate(dsock->out_compress, Z_FINISH) != Z_STREAM_END && !forced)
     return FALSE;
 
   /* try to send any residual data */
-  if (!processCompressed(dsock))
+  if (!processCompressed(dsock) && !forced)
     return FALSE;
 
   /* reset compression values */

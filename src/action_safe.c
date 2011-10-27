@@ -24,8 +24,8 @@ void cmd_quit(D_MOBILE *dMob, char *arg)
   char buf[MAX_BUFFER];
 
   /* log the attempt */
-  sprintf(buf, "%s has left the game.", dMob->name);
-  log(buf);
+  snprintf(buf, MAX_BUFFER, "%s has left the game.", dMob->name);
+  log_string(buf);
 
   save_player(dMob);
 
@@ -61,18 +61,24 @@ void cmd_who(D_MOBILE *dMob, char *arg)
 {
   D_MOBILE *xMob;
   D_SOCKET *dsock;
+  ITERATOR Iter;
   BUFFER *buf = buffer_new(MAX_BUFFER);
 
   bprintf(buf, " - - - - ----==== Who's Online ====---- - - - -\n\r");
-  for (dsock = dsock_list; dsock; dsock = dsock->next)
+
+  AttachIterator(&Iter, dsock_list);
+  while ((dsock = (D_SOCKET *) NextInList(&Iter)) != NULL)
   {
     if (dsock->state != STATE_PLAYING) continue;
     if ((xMob = dsock->player) == NULL) continue;
 
     bprintf(buf, " %-12s   %s\n\r", xMob->name, dsock->hostname);
   }
+  DetachIterator(&Iter);
+
   bprintf(buf, " - - - - ----======================---- - - - -\n\r");
   text_to_mobile(dMob, buf->data);
+
   buffer_free(buf);
 }
 
@@ -81,26 +87,30 @@ void cmd_help(D_MOBILE *dMob, char *arg)
   if (arg[0] == '\0')
   {
     HELP_DATA *pHelp;
+    ITERATOR Iter;
     BUFFER *buf = buffer_new(MAX_BUFFER);
     int col = 0;
 
     bprintf(buf, "      - - - - - ----====//// HELP FILES  \\\\\\\\====---- - - - - -\n\n\r");
-    for (pHelp = help_list; pHelp; pHelp = pHelp->next)
+
+    AttachIterator(&Iter, help_list);
+    while ((pHelp = (HELP_DATA *) NextInList(&Iter)) != NULL)
     {
       bprintf(buf, " %-19.18s", pHelp->keyword);
       if (!(++col % 4)) bprintf(buf, "\n\r");
     }
+    DetachIterator(&Iter);
+
     if (col % 4) bprintf(buf, "\n\r");
     bprintf(buf, "\n\r Syntax: help <topic>\n\r");
     text_to_mobile(dMob, buf->data);
     buffer_free(buf);
+
     return;
   }
+
   if (!check_help(dMob, arg))
-  {
     text_to_mobile(dMob, "Sorry, no such helpfile.\n\r");
-    return;
-  }
 }
 
 void cmd_compress(D_MOBILE *dMob, char *arg)
@@ -118,7 +128,7 @@ void cmd_compress(D_MOBILE *dMob, char *arg)
   }
   else /* disable compression */
   {
-    if (!compressEnd(dMob->socket))
+    if (!compressEnd(dMob->socket, dMob->socket->compressing, FALSE))
     {
       text_to_mobile(dMob, "Failed.\n\r");
       return;
@@ -136,8 +146,9 @@ void cmd_save(D_MOBILE *dMob, char *arg)
 void cmd_copyover(D_MOBILE *dMob, char *arg)
 { 
   FILE *fp;
-  D_SOCKET *dsock, *dsock_next;
-  char buf[100];
+  ITERATOR Iter;
+  D_SOCKET *dsock;
+  char buf[MAX_BUFFER];
   
   if ((fp = fopen(COPYOVER_FILE, "w")) == NULL)
   {
@@ -145,13 +156,14 @@ void cmd_copyover(D_MOBILE *dMob, char *arg)
     return;
   }
 
-  sprintf(buf, "\n\r <*>            The world starts spinning             <*>\n\r");
-  
+  strncpy(buf, "\n\r <*>            The world starts spinning             <*>\n\r", MAX_BUFFER);
+
   /* For each playing descriptor, save its state */
-  for (dsock = dsock_list; dsock ; dsock = dsock_next)
+  AttachIterator(&Iter, dsock_list);
+  while ((dsock = (D_SOCKET *) NextInList(&Iter)) != NULL)
   {
-    dsock_next = dsock->next;
- 
+    compressEnd(dsock, dsock->compressing, FALSE);
+
     if (dsock->state != STATE_PLAYING)
     {
       text_to_socket(dsock, "\n\rSorry, we are rebooting. Come back in a few minutes.\n\r");
@@ -159,26 +171,30 @@ void cmd_copyover(D_MOBILE *dMob, char *arg)
     }
     else
     {
-      fprintf(fp, "%d %s %s %c\n",
-        dsock->control, dsock->player->name, dsock->hostname, dsock->compressing);
+      fprintf(fp, "%d %s %s\n",
+        dsock->control, dsock->player->name, dsock->hostname);
 
       /* save the player */
       save_player(dsock->player);
 
       text_to_socket(dsock, buf);
-      compressEnd(dsock);
     }
   }
-  
+  DetachIterator(&Iter);
+
   fprintf (fp, "-1\n");
   fclose (fp);
 
   /* close any pending sockets */
   recycle_sockets();
   
-  /* exec - descriptors are inherited */
-  sprintf(buf, "%d", control);
-  execl(EXE_FILE, "SocketMud", "copyover", buf, (char *) NULL, (char *) NULL);
+  /*
+   * feel free to add any additional arguments between the 2nd and 3rd,
+   * that is "SocketMud" and buf, but leave the last three in that order,
+   * to ensure that the main() function can parse the input correctly.
+   */
+  snprintf(buf, MAX_BUFFER, "%d", control);
+  execl(EXE_FILE, "SocketMud", buf, "copyover", (char *) NULL);
 
   /* Failed - sucessful exec will not return */
   text_to_mobile(dMob, "Copyover FAILED!\n\r");
@@ -187,14 +203,22 @@ void cmd_copyover(D_MOBILE *dMob, char *arg)
 void cmd_linkdead(D_MOBILE *dMob, char *arg)
 {
   D_MOBILE *xMob;
+  ITERATOR Iter;
   char buf[MAX_BUFFER];
+  bool found = FALSE;
 
-  for (xMob = dmobile_list; xMob; xMob = xMob->next)
+  AttachIterator(&Iter, dmobile_list);
+  while ((xMob = (D_MOBILE *) NextInList(&Iter)) != NULL)
   {
     if (!xMob->socket)
     {
-      sprintf(buf, "%s is linkdead.\n\r", xMob->name);
+      snprintf(buf, MAX_BUFFER, "%s is linkdead.\n\r", xMob->name);
       text_to_mobile(dMob, buf);
+      found = TRUE;
     }
   }
+  DetachIterator(&Iter);
+
+  if (!found)
+    text_to_mobile(dMob, "Noone is currently linkdead.\n\r");
 }

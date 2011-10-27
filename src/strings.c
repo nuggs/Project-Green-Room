@@ -12,28 +12,6 @@
 #include "mud.h"
 
 /*
- * Compares two strings, and returns TRUE
- * if they match 100% (not case sensetive).
- */
-bool compares(const char *aStr, const char *bStr)
-{
-  int i = 0;
-
-  /* NULL strings never compares */
-  if (aStr == NULL || bStr == NULL) return FALSE;
-
-  while (aStr[i] != '\0' && bStr[i] != '\0' && toupper(aStr[i]) == toupper(bStr[i]))
-    i++;
-
-  /* if we terminated for any reason except the end of both strings return FALSE */
-  if (aStr[i] != '\0' || bStr[i] != '\0')
-    return FALSE;
-
-  /* success */
-  return TRUE;
-}
-
-/*
  * Checks if aStr is a prefix of bStr.
  */
 bool is_prefix(const char *aStr, const char *bStr)
@@ -170,7 +148,8 @@ void buffer_free(BUFFER *buffer)
 /* Clear a buffer's contents, but do not deallocate anything */
 void buffer_clear(BUFFER *buffer)
 {
-  buffer->len = 0;  
+  buffer->len = 0;
+  buffer->data[0] = '\0';
 }
 
 /* print stuff, append to buffer. safe. */
@@ -193,4 +172,43 @@ int bprintf(BUFFER *buffer, char *fmt, ...)
     buffer_strcat(buffer, buf);
    
   return res;
+}
+
+char *strdup(const char *s)
+{
+  char *pstr;
+  int len;
+
+  len = strlen(s) + 1;
+  pstr = (char *) calloc(1, len);
+  strcpy(pstr, s);
+
+  return pstr;
+}
+
+int strcasecmp(const char *s1, const char *s2)
+{
+  int i = 0;
+
+  while (s1[i] != '\0' && s2[i] != '\0' && toupper(s1[i]) == toupper(s2[i]))
+    i++;
+
+  /* if they matched, return 0 */
+  if (s1[i] == '\0' && s2[i] == '\0')
+    return 0;
+
+  /* is s1 a prefix of s2? */
+  if (s1[i] == '\0')
+    return -110;
+
+  /* is s2 a prefix of s1? */
+  if (s2[i] == '\0')
+    return 110;
+
+  /* is s1 less than s2? */
+  if (toupper(s1[i]) < toupper(s2[i]))
+    return -1;
+
+  /* s2 is less than s1 */
+  return 1;
 }

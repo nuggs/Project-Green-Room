@@ -22,11 +22,11 @@
 #include "mud.h"
 
 /* global variables */
-fd_set        fSet;                  /* the socket list for polling       */
-D_SOCKET    * dsock_free = NULL;     /* the socket free list              */
-D_SOCKET    * dsock_list = NULL;     /* the linked list of active sockets */
-D_MOBILE    * dmobile_free = NULL;   /* the mobile free list              */
-D_MOBILE    * dmobile_list = NULL;   /* the mobile list of active mobiles */
+fd_set     fSet;                  /* the socket list for polling       */
+STACK    * dsock_free = NULL;     /* the socket free list              */
+LIST     * dsock_list = NULL;     /* the linked list of active sockets */
+STACK    * dmobile_free = NULL;   /* the mobile free list              */
+LIST     * dmobile_list = NULL;   /* the mobile list of active mobiles */
 
 /* mccp support */
 const unsigned char compress_will   [] = { IAC, WILL, TELOPT_COMPRESS,  '\0' };
@@ -35,7 +35,7 @@ const unsigned char do_echo         [] = { IAC, WONT, TELOPT_ECHO,      '\0' };
 const unsigned char dont_echo       [] = { IAC, WILL, TELOPT_ECHO,      '\0' };
 
 /* local procedures */
-void game_loop    ( int control );
+void GameLoop         ( int control );
 
 /* intialize shutdown state */
 bool shut_down = FALSE;
@@ -51,13 +51,22 @@ int main(int argc, char **argv)
   /* get the current time */
   current_time = time(NULL);
 
-  /* note that we are booting up */
-  log("Program starting.");
+  /* allocate memory for socket and mobile lists'n'stacks */
+  dsock_free = AllocStack();
+  dsock_list = AllocList();
+  dmobile_free = AllocStack();
+  dmobile_list = AllocList();
 
-  if (argv[1] && argv[1][0])
+  /* note that we are booting up */
+  log_string("Program starting.");
+
+  /* initialize the event queue - part 1 */
+  init_event_queue(1);
+
+  if (argc > 2 && !strcmp(argv[argc-1], "copyover") && atoi(argv[argc-2]) > 0)
   {
     fCopyOver = TRUE;
-    control = atoi(argv[2]);
+    control = atoi(argv[argc-2]);
   }
   else fCopyOver = FALSE;
 
@@ -68,34 +77,34 @@ int main(int argc, char **argv)
   /* load all external data */
   load_muddata(fCopyOver);
 
+  /* initialize the event queue - part 2*/
+  init_event_queue(2);
+
   /* main game loop */
-  game_loop(control);
+  GameLoop(control);
 
   /* close down the socket */
   close(control);
 
   /* terminated without errors */
-  log("Program terminated without errors.");
+  log_string("Program terminated without errors.");
 
+  /* and we are done */
   return 0;
 }
 
-void game_loop(int control)   
+void GameLoop(int control)   
 {
   D_SOCKET *dsock;
-  D_SOCKET *dsock_next;
-  struct timeval tv;
+  ITERATOR Iter;
+  static struct timeval tv;
+  struct timeval last_time, new_time;
   extern fd_set fSet;
-  time_t check_timer = 0;
   fd_set rFd;
-  bool wait_state;
-  int fmax;
+  long secs, usecs;
 
-  if ((fmax = getdtablesize()) < 1)
-  {
-    bug("Game_loop: Fatal error in getdtablesize()");
-    return;
-  }
+  /* set this for the first loop */
+  gettimeofday(&last_time, NULL);
 
   /* clear out the file socket set */
   FD_ZERO(&fSet);
@@ -104,28 +113,22 @@ void game_loop(int control)
   FD_SET(control, &fSet);
 
   /* copyover recovery */
-  for (dsock = dsock_list; dsock; dsock = dsock->next)
+  AttachIterator(&Iter, dsock_list);
+  while ((dsock = (D_SOCKET *) NextInList(&Iter)) != NULL)
     FD_SET(dsock->control, &fSet);
+  DetachIterator(&Iter);
 
   /* do this untill the program is shutdown */
   while (!shut_down)
   {
-    /* reset the wait_state */
-    wait_state = FALSE;
+    /* set current_time */
+    current_time = time(NULL);
 
     /* copy the socket set */
     memcpy(&rFd, &fSet, sizeof(fd_set));
 
-    /*
-     * Set the default timeout to 0.5 seconds,
-     * to make sure we can call the update function
-     * roughly once every second (can be a little off).
-     */
-    tv.tv_sec  = 0;
-    tv.tv_usec = 500000;
-
     /* wait for something to happen */
-    if (select(fmax, &rFd, NULL, NULL, &tv) < 0)
+    if (select(FD_SETSIZE, &rFd, NULL, NULL, &tv) < 0)
       continue;
 
     /* check for new connections */
@@ -141,25 +144,15 @@ void game_loop(int control)
     }
 
     /* poll sockets in the socket list */
-    for (dsock = dsock_list; dsock; dsock = dsock_next)
+    AttachIterator(&Iter ,dsock_list);
+    while ((dsock = (D_SOCKET *) NextInList(&Iter)) != NULL)
     {
-      dsock_next = dsock->next;
-
       /*
-       * If the socket still is in the set,
-       * but we are unable to read from it,
-       * we close it.   
+       * Close sockects we are unable to read from.
        */
       if (FD_ISSET(dsock->control, &rFd) && !read_from_socket(dsock))
       {
         close_socket(dsock, FALSE);
-        continue;
-      }
-
-      /* Is the socket allowed to do a new command ? */
-      if (dsock->waitstate > 0)
-      {
-        if (wait_state) dsock->waitstate--;
         continue;
       }
 
@@ -189,28 +182,56 @@ void game_loop(int control)
         dsock->next_command[0] = '\0';
       }
 
-      /* if the player quits */
+      /* if the player quits or get's disconnected */
       if (dsock->state == STATE_CLOSED) continue;
 
-      /*
-       * Send all new data to the socket   
-       * and close it if any errors occour.
-       */
+      /* Send all new data to the socket and close it if any errors occour */
       if (!flush_output(dsock))
         close_socket(dsock, FALSE);
     }
+    DetachIterator(&Iter);
+
+    /* call the event queue */
+    heartbeat();
 
     /*
-     * We get here at least once every 0.5 seconds,
-     * so it should be possible to hit once every
-     * second with some accuracy.
+     * Here we sleep out the rest of the pulse, thus forcing
+     * SocketMud(tm) to run at PULSES_PER_SECOND pulses each second.
      */
-    if (((current_time = time(NULL)) - check_timer) >= 1)
+    gettimeofday(&new_time, NULL);
+
+    /* get the time right now, and calculate how long we should sleep */
+    usecs = (int) (last_time.tv_usec -  new_time.tv_usec) + 1000000 / PULSES_PER_SECOND;
+    secs  = (int) (last_time.tv_sec  -  new_time.tv_sec);
+
+    /*
+     * Now we make sure that 0 <= usecs < 1.000.000
+     */
+    while (usecs < 0)
     {
-      wait_state = TRUE;         /* make sure all sockets have their wait_state decreased */
-      check_timer = time(NULL);  /* resets the check_timer                                */
-      update_handler();          /* calls the top-level update function                   */
+      usecs += 1000000;
+      secs  -= 1;
     }
+    while (usecs >= 1000000)
+    {
+      usecs -= 1000000;
+      secs  += 1;
+    }
+
+    /* if secs < 0 we don't sleep, since we have encountered a laghole */
+    if (secs > 0 || (secs == 0 && usecs > 0))
+    {
+      struct timeval sleep_time;
+
+      sleep_time.tv_usec = usecs;
+      sleep_time.tv_sec  = secs;
+
+      if (select(0, NULL, NULL, NULL, &sleep_time) < 0)
+        continue;
+    }
+
+    /* reset the last time we where sleeping */
+    gettimeofday(&last_time, NULL);
 
     /* recycle sockets */
     recycle_sockets();
@@ -277,7 +298,7 @@ bool new_socket(int sock)
    * allocate some memory for a new socket if
    * there is no free socket in the free_list
    */
-  if (dsock_free == NULL)
+  if (StackSize(dsock_free) <= 0)
   {
     if ((sock_new = malloc(sizeof(*sock_new))) == NULL)
     {
@@ -287,8 +308,7 @@ bool new_socket(int sock)
   }
   else
   {
-    sock_new   = dsock_free;
-    dsock_free = dsock_free->next;
+    sock_new = (D_SOCKET *) PopStack(dsock_free);
   }
 
   /* attach the new connection to the socket list */
@@ -301,8 +321,7 @@ bool new_socket(int sock)
   ioctl(sock, FIONBIO, &argp);
 
   /* update the linked list of sockets */
-  sock_new->next  =  dsock_list;
-  dsock_list      =  sock_new;
+  AttachToList(sock_new, dsock_list);
 
   /* do a host lookup */
   size = sizeof(sock_addr);
@@ -316,7 +335,7 @@ bool new_socket(int sock)
     /* set the IP number as the temporary hostname */
     sock_new->hostname = strdup(inet_ntoa(sock_addr.sin_addr));
 
-    if (!compares(sock_new->hostname, "127.0.0.1"))
+    if (strcasecmp(sock_new->hostname, "127.0.0.1"))
     {
       /* allocate some memory for the lookup data */
       if ((lData = malloc(sizeof(*lData))) == NULL)
@@ -343,6 +362,9 @@ bool new_socket(int sock)
   text_to_buffer(sock_new, greeting);
   text_to_buffer(sock_new, "What is your name? ");
 
+  /* initialize socket events */
+  init_events_socket(sock_new);
+
   /* everything went as it was supposed to */
   return TRUE;
 }
@@ -356,6 +378,9 @@ bool new_socket(int sock)
  */
 void close_socket(D_SOCKET *dsock, bool reconnect)
 {
+  EVENT_DATA *pEvent;
+  ITERATOR Iter;
+
   if (dsock->lookup_status > TSTATE_DONE) return;
   dsock->lookup_status += 2;
 
@@ -369,11 +394,17 @@ void close_socket(D_SOCKET *dsock, bool reconnect)
     else if (dsock->player)
     {
       dsock->player->socket = NULL;
-      log("Closing link to %s", dsock->player->name);
+      log_string("Closing link to %s", dsock->player->name);
     }
   }
   else if (dsock->player)
     free_mobile(dsock->player);
+
+  /* dequeue all events for this socket */
+  AttachIterator(&Iter, dsock->events);
+  while ((pEvent = (EVENT_DATA *) NextInList(&Iter)) != NULL)
+    dequeue_event(pEvent);
+  DetachIterator(&Iter);
 
   /* set the closed state */
   dsock->state = STATE_CLOSED;
@@ -416,7 +447,7 @@ bool read_from_socket(D_SOCKET *dsock)
     }
     else if (sInput == 0)
     {
-      log("Read_from_socket: EOF");
+      log_string("Read_from_socket: EOF");
       return FALSE;
     }
     else if (errno == EAGAIN || sInput == wanted)
@@ -510,14 +541,48 @@ bool text_to_socket(D_SOCKET *dsock, const char *txt)
  */
 void text_to_buffer(D_SOCKET *dsock, const char *txt)
 {
-  static char output[8 * MAX_OUTPUT];
-  char *ptr;
-  bool color = FALSE;
-  int size;
+  static char output[8 * MAX_BUFFER];
+  bool underline = FALSE, bold = FALSE;
+  int iPtr = 0, last = -1, j, k;
+  int length = strlen(txt);
 
-  /* clear the output buffer, and set the pointer */
-  output[0] = '\0';
-  ptr = output;
+  /* the color struct */
+  struct sAnsiColor
+  {
+    const char    cTag;
+    const char  * cString;
+    int           aFlag;
+  };
+
+  /* the color table... */
+  const struct sAnsiColor ansiTable[] =
+  {
+    { 'd',  "30",  eTHIN },
+    { 'D',  "30",  eBOLD },
+    { 'r',  "31",  eTHIN },
+    { 'R',  "31",  eBOLD },
+    { 'g',  "32",  eTHIN },
+    { 'G',  "32",  eBOLD },
+    { 'y',  "33",  eTHIN },
+    { 'Y',  "33",  eBOLD },
+    { 'b',  "34",  eTHIN },
+    { 'B',  "34",  eBOLD },
+    { 'p',  "35",  eTHIN },
+    { 'P',  "35",  eBOLD },
+    { 'c',  "36",  eTHIN },
+    { 'C',  "36",  eBOLD },
+    { 'w',  "37",  eTHIN },
+    { 'W',  "37",  eBOLD },
+
+    /* the end tag */
+    { '\0',  "",   eTHIN }
+  };
+
+  if (length >= MAX_BUFFER)
+  {
+    log_string("text_to_buffer: buffer overflow.");
+    return;
+  }
 
   /* always start with a leading space */
   if (dsock->top_output == 0)
@@ -529,141 +594,162 @@ void text_to_buffer(D_SOCKET *dsock, const char *txt)
 
   while (*txt != '\0')
   {
+    /* simple bound checking */
+    if (iPtr > (8 * MAX_BUFFER - 15))
+      break;
+
     switch(*txt)
     {
       default:
-        *ptr++ = *txt++;
+        output[iPtr++] = *txt++;
         break;
       case '#':
-        switch(*++txt)
+        txt++;
+
+        /* toggle underline on/off with #u */
+        if (*txt == 'u')
         {
-          default:
-            *ptr++ = '#';
-            break;
-          case 'n':  // stock color
-            txt++; color = FALSE;
-            *ptr++ = 27;   *ptr++ = '[';   *ptr++ = '0';
-            *ptr++ = 'm';
-            break;
-          case 'd':  // Dark
-            txt++; color = TRUE;
-            *ptr++ = 27;    *ptr++ = '[';
-            *ptr++ = '0';   *ptr++ = ';';
-            *ptr++ = '3';   *ptr++ = '0';   *ptr++ = 'm';
-            break;
-          case 'D':  // Bold Dark
-            txt++; color = TRUE;
-            *ptr++ = 27;    *ptr++ = '[';
-            *ptr++ = '1';   *ptr++ = ';';
-            *ptr++ = '3';   *ptr++ = '0';   *ptr++ = 'm';
-            break;
-          case 'r':  // Red
-            txt++; color = TRUE;
-            *ptr++ = 27;    *ptr++ = '[';
-            *ptr++ = '0';   *ptr++ = ';';
-            *ptr++ = '3';   *ptr++ = '1';   *ptr++ = 'm';
-            break;
-          case 'R':  // Bold Red 
-            txt++; color = TRUE;
-            *ptr++ = 27;    *ptr++ = '[';
-            *ptr++ = '1';   *ptr++ = ';';
-            *ptr++ = '3';   *ptr++ = '1';   *ptr++ = 'm';
-            break;
-          case 'g':  // Green
-            txt++; color = TRUE;
-            *ptr++ = 27;    *ptr++ = '[';
-            *ptr++ = '0';   *ptr++ = ';';
-            *ptr++ = '3';   *ptr++ = '2';   *ptr++ = 'm';
-            break;
-          case 'G':  // Bold Green
-            txt++; color = TRUE;
-            *ptr++ = 27;    *ptr++ = '[';
-            *ptr++ = '1';   *ptr++ = ';';
-            *ptr++ = '3';   *ptr++ = '2';   *ptr++ = 'm';
-            break;
-          case 'y':  // Yellow
-            txt++; color = TRUE;
-            *ptr++ = 27;    *ptr++ = '[';
-            *ptr++ = '0';   *ptr++ = ';';
-            *ptr++ = '3';   *ptr++ = '3';   *ptr++ = 'm';
-            break;
-          case 'Y':  // Bold Yellow
-            txt++; color = TRUE;
-            *ptr++ = 27;    *ptr++ = '[';
-            *ptr++ = '1';   *ptr++ = ';';
-            *ptr++ = '3';   *ptr++ = '3';   *ptr++ = 'm';
-            break;
-          case 'b':  // Blue
-            txt++; color = TRUE;
-            *ptr++ = 27;    *ptr++ = '[';
-            *ptr++ = '0';   *ptr++ = ';';
-            *ptr++ = '3';   *ptr++ = '4';   *ptr++ = 'm';
-            break;
-          case 'B':  // Bold Blue
-            txt++; color = TRUE;
-            *ptr++ = 27;    *ptr++ = '[';
-            *ptr++ = '1';   *ptr++ = ';';
-            *ptr++ = '3';   *ptr++ = '4';   *ptr++ = 'm';
-            break;
-          case 'p':  // Pink
-            txt++; color = TRUE;
-            *ptr++ = 27;    *ptr++ = '[';
-            *ptr++ = '0';   *ptr++ = ';';
-            *ptr++ = '3';   *ptr++ = '5';   *ptr++ = 'm';
-            break;
-          case 'P':  // Bold Pink
-            txt++; color = TRUE;
-            *ptr++ = 27;    *ptr++ = '[';
-            *ptr++ = '1';   *ptr++ = ';';
-            *ptr++ = '3';   *ptr++ = '5';   *ptr++ = 'm';
-            break;
-          case 'c':  // Cyan
-            txt++; color = TRUE;
-            *ptr++ = 27;    *ptr++ = '[';
-            *ptr++ = '0';   *ptr++ = ';';
-            *ptr++ = '3';   *ptr++ = '6';   *ptr++ = 'm';
-            break;
-          case 'C':  // Bold Cyan
-            txt++; color = TRUE;
-            *ptr++ = 27;    *ptr++ = '[';
-            *ptr++ = '1';   *ptr++ = ';';
-            *ptr++ = '3';   *ptr++ = '6';   *ptr++ = 'm';
-            break;
-          case 'w':  // White
-            txt++; color = TRUE;
-            *ptr++ = 27;    *ptr++ = '[';
-            *ptr++ = '0';   *ptr++ = ';';
-            *ptr++ = '3';   *ptr++ = '7';   *ptr++ = 'm';
-            break;
-          case 'W':  // Bold White
-            txt++; color = TRUE;
-            *ptr++ = 27;    *ptr++ = '[';
-            *ptr++ = '1';   *ptr++ = ';';
-            *ptr++ = '3';   *ptr++ = '7';   *ptr++ = 'm';
-            break;
+          txt++;
+          if (underline)
+          {
+            underline = FALSE;
+            output[iPtr++] =  27; output[iPtr++] = '['; output[iPtr++] = '0';
+            if (bold)
+            {
+              output[iPtr++] = ';'; output[iPtr++] = '1';
+            }
+            if (last != -1)
+            {
+              output[iPtr++] = ';';
+              for (j = 0; ansiTable[last].cString[j] != '\0'; j++)
+              {
+                output[iPtr++] = ansiTable[last].cString[j];
+              }
+            }
+            output[iPtr++] = 'm';
+          }
+          else
+          {
+            underline = TRUE;
+            output[iPtr++] =  27; output[iPtr++] = '[';
+            output[iPtr++] = '4'; output[iPtr++] = 'm';
+          }
         }
+
+        /* parse ## to # */
+        else if (*txt == '#')
+        {
+          txt++;
+          output[iPtr++] = '#';
+        }
+
+        /* #n should clear all tags */
+        else if (*txt == 'n')
+        {
+          txt++;
+          if (last != -1 || underline || bold)
+          {  
+            underline = FALSE;
+            bold = FALSE;
+            output[iPtr++] =  27; output[iPtr++] = '[';
+            output[iPtr++] = '0'; output[iPtr++] = 'm';
+          }
+
+          last = -1;
+        }
+
+        /* check for valid color tag and parse */
+        else
+        {
+          bool validTag = FALSE;
+
+          for (j = 0; ansiTable[j].cString[0] != '\0'; j++)
+          {
+            if (*txt == ansiTable[j].cTag)
+            {
+              validTag = TRUE;
+
+              /* we only add the color sequence if it's needed */
+              if (last != j)
+              {
+                bool cSequence = FALSE;
+
+                /* escape sequence */
+                output[iPtr++] = 27; output[iPtr++] = '[';
+
+                /* remember if a color change is needed */
+                if (last == -1 || last / 2 != j / 2)
+                  cSequence = TRUE;
+
+                /* handle font boldness */
+                if (bold && ansiTable[j].aFlag == eTHIN)
+                {
+                  output[iPtr++] = '0';
+                  bold = FALSE;
+
+                  if (underline)
+                  {
+                    output[iPtr++] = ';'; output[iPtr++] = '4';
+                  }
+
+                  /* changing to eTHIN wipes the old color */
+                  output[iPtr++] = ';';
+                  cSequence = TRUE;
+                }
+                else if (!bold && ansiTable[j].aFlag == eBOLD)
+                {
+                  output[iPtr++] = '1';
+                  bold = TRUE;
+
+                  if (cSequence)
+                    output[iPtr++] = ';';
+                }
+
+                /* add color sequence if needed */
+                if (cSequence)
+                {
+                  for (k = 0; ansiTable[j].cString[k] != '\0'; k++)
+                  {
+                    output[iPtr++] = ansiTable[j].cString[k];
+                  }
+                }
+
+                output[iPtr++] = 'm';
+              }
+
+              /* remember the last color */
+              last = j;
+            }
+          }
+
+          /* it wasn't a valid color tag */
+          if (!validTag)
+            output[iPtr++] = '#';
+          else
+            txt++;
+        }
+        break;   
     }
   }
 
-  /* and terminate it with the standard color (White) */
-  if (color)
+  /* and terminate it with the standard color */
+  if (last != -1 || underline || bold)
   {
-    *ptr++ = 27;
-    *ptr++ = '[';
-    *ptr++ = '0';
-    *ptr++ = 'm';
+    output[iPtr++] =  27; output[iPtr++] = '[';
+    output[iPtr++] = '0'; output[iPtr++] = 'm';
   }
-  *ptr = '\0';
+  output[iPtr] = '\0';
 
-  size = strlen(output);
-
-  if (dsock->top_output + size >= MAX_OUTPUT)
+  /* check to see if the socket can accept that much data */
+  if (dsock->top_output + iPtr >= MAX_OUTPUT)
   {
     bug("Text_to_buffer: ouput overflow on %s.", dsock->hostname);
     return;
   }
+
+  /* add data to buffer */
   strcpy(dsock->outbuf + dsock->top_output, output);
-  dsock->top_output += size;
+  dsock->top_output += iPtr;
 }
 
 /*
@@ -721,14 +807,14 @@ void next_cmd_from_buffer(D_SOCKET *dsock)
         if (dsock->inbuf[i-1] == (signed char) DO)                  /* start compressing   */
           compressStart(dsock, TELOPT_COMPRESS);
         else if (dsock->inbuf[i-1] == (signed char) DONT)           /* stop compressing    */
-          compressEnd(dsock);
+          compressEnd(dsock, TELOPT_COMPRESS, FALSE);
       }
       else if (dsock->inbuf[i] == (signed char) TELOPT_COMPRESS2)   /* check for version 2 */
       {
         if (dsock->inbuf[i-1] == (signed char) DO)                  /* start compressing   */
           compressStart(dsock, TELOPT_COMPRESS2);
         else if (dsock->inbuf[i-1] == (signed char) DONT)           /* stop compressing    */
-          compressEnd(dsock);
+          compressEnd(dsock, TELOPT_COMPRESS2, FALSE);
       }
     }
     else if (isprint(dsock->inbuf[i]) && isascii(dsock->inbuf[i]))
@@ -787,6 +873,7 @@ bool flush_output(D_SOCKET *dsock)
 void handle_new_connections(D_SOCKET *dsock, char *arg)
 {
   D_MOBILE *p_new;
+  int i;
 
   switch(dsock->state)
   {
@@ -805,12 +892,12 @@ void handle_new_connections(D_SOCKET *dsock, char *arg)
         break;
       }
       arg[0] = toupper(arg[0]);
-      log("%s is trying to connect.", arg);
+      log_string("%s is trying to connect.", arg);
 
       /* Check for a new Player */
       if ((p_new = load_profile(arg)) == NULL)
       {
-        if (dmobile_free == NULL)
+        if (StackSize(dmobile_free) <= 0)
         {
           if ((p_new = malloc(sizeof(*p_new))) == NULL)
           {
@@ -820,8 +907,7 @@ void handle_new_connections(D_SOCKET *dsock, char *arg)
         }
         else
         {
-          p_new        = dmobile_free; 
-          dmobile_free = dmobile_free->next;
+          p_new = (D_MOBILE *) PopStack(dmobile_free);
         }
         clear_mobile(p_new);
 
@@ -850,53 +936,74 @@ void handle_new_connections(D_SOCKET *dsock, char *arg)
         text_to_buffer(dsock, "Between 5 and 12 chars please!\n\rPlease enter a new password: ");
         return;
       }
+
+      free(dsock->player->password);
       dsock->player->password = strdup(crypt(arg, dsock->player->name));
+
+      for (i = 0; dsock->player->password[i] != '\0'; i++)
+      {
+	if (dsock->player->password[i] == '~')
+	{
+	  text_to_buffer(dsock, "Illegal password!\n\rPlease enter a new password: ");
+	  return;
+	}
+      }
+
       text_to_buffer(dsock, "Please verify the password: ");
       dsock->state = STATE_VERIFY_PASSWORD;
       break;
     case STATE_VERIFY_PASSWORD:
-      if (compares(crypt(arg, dsock->player->name), dsock->player->password))
+      if (!strcmp(crypt(arg, dsock->player->name), dsock->player->password))
       {
         text_to_buffer(dsock, (char *) do_echo);
 
         /* put him in the list */
-        dsock->player->next = dmobile_list;
-        dmobile_list        = dsock->player;
+        AttachToList(dsock->player, dmobile_list);
 
-        log("New player: %s has entered the game.", dsock->player->name);
+        log_string("New player: %s has entered the game.", dsock->player->name);
 
         /* and into the game */
         dsock->state = STATE_PLAYING;
         text_to_buffer(dsock, motd);
+
+        /* initialize events on the player */
+        init_events_player(dsock->player);
+
+        /* strip the idle event from this socket */
+        strip_event_socket(dsock, EVENT_SOCKET_IDLE);
       }
       else
       {
         free(dsock->player->password);
+        dsock->player->password = NULL;
         text_to_buffer(dsock, "Password mismatch!\n\rPlease enter a new password: ");
         dsock->state = STATE_NEW_PASSWORD;
       }
       break;
     case STATE_ASK_PASSWORD:
       text_to_buffer(dsock, (char *) do_echo);
-      if (compares(crypt(arg, dsock->player->name), dsock->player->password))
+      if (!strcmp(crypt(arg, dsock->player->name), dsock->player->password))
       {
         if ((p_new = check_reconnect(dsock->player->name)) != NULL)
         {
           /* attach the new player */
-          ex_free_mob(dsock->player);
+          free_mobile(dsock->player);
           dsock->player = p_new;
           p_new->socket = dsock;
 
-          log("%s has reconnected.", dsock->player->name);
+          log_string("%s has reconnected.", dsock->player->name);
 
           /* and let him enter the game */
           dsock->state = STATE_PLAYING;
           text_to_buffer(dsock, "You take over a body already in use.\n\r");
+
+          /* strip the idle event from this socket */
+          strip_event_socket(dsock, EVENT_SOCKET_IDLE);
         }
         else if ((p_new = load_player(dsock->player->name)) == NULL)
         {
           text_to_socket(dsock, "ERROR: Your pfile is missing!\n\r");
-          ex_free_mob(dsock->player);
+          free_mobile(dsock->player);
           dsock->player = NULL;
           close_socket(dsock, FALSE);
           return;
@@ -904,25 +1011,30 @@ void handle_new_connections(D_SOCKET *dsock, char *arg)
         else
         {
           /* attach the new player */
-          ex_free_mob(dsock->player);
+          free_mobile(dsock->player);
           dsock->player = p_new;
           p_new->socket = dsock;
 
           /* put him in the active list */
-          p_new->next   =  dmobile_list;
-          dmobile_list  =  p_new;
+          AttachToList(p_new, dmobile_list);
 
-          log("%s has entered the game.", dsock->player->name);
+          log_string("%s has entered the game.", dsock->player->name);
 
           /* and let him enter the game */
           dsock->state = STATE_PLAYING;
           text_to_buffer(dsock, motd);
+
+	  /* initialize events on the player */
+	  init_events_player(dsock->player);
+
+	  /* strip the idle event from this socket */
+	  strip_event_socket(dsock, EVENT_SOCKET_IDLE);
         }
       }
       else
       {
         text_to_socket(dsock, "Bad password!\n\r");
-        ex_free_mob(dsock->player);
+        free_mobile(dsock->player);
         dsock->player = NULL;
         close_socket(dsock, FALSE);
       }
@@ -932,15 +1044,14 @@ void handle_new_connections(D_SOCKET *dsock, char *arg)
 
 void clear_socket(D_SOCKET *sock_new, int sock)
 {
-  static D_SOCKET sock_empty;
+  memset(sock_new, 0, sizeof(*sock_new));
 
-  *sock_new                =  sock_empty;
   sock_new->control        =  sock;
   sock_new->state          =  STATE_NEW_NAME;
   sock_new->lookup_status  =  TSTATE_LOOKUP;
   sock_new->player         =  NULL;
-  sock_new->waitstate      =  0; 
   sock_new->top_output     =  0;
+  sock_new->events         =  AllocList();
 }
 
 /* does the lookup, changes the hostname, and dies */
@@ -975,27 +1086,16 @@ void *lookup_address(void *arg)
 
 void recycle_sockets()
 {
-  D_SOCKET *dsock, *dsock_next;
+  D_SOCKET *dsock;
+  ITERATOR Iter;
 
-  for (dsock = dsock_list; dsock; dsock = dsock_next)
+  AttachIterator(&Iter, dsock_list);
+  while ((dsock = (D_SOCKET *) NextInList(&Iter)) != NULL)
   {
-    dsock_next = dsock->next;
     if (dsock->lookup_status != TSTATE_CLOSED) continue;
 
     /* remove the socket from the socket list */
-    if (dsock == dsock_list)
-      dsock_list = dsock->next;
-    else
-    {
-      D_SOCKET *prev;
-
-      for (prev = dsock_list; prev && prev->next != dsock; prev = prev->next)
-        ;
-      if (prev)
-        prev->next = dsock->next;
-      else
-        bug("Recycle_sockets: Closed socket not in list");
-    }
+    DetachFromList(dsock, dsock_list);
 
     /* close the socket */
     close(dsock->control);
@@ -1003,11 +1103,14 @@ void recycle_sockets()
     /* free the memory */
     free(dsock->hostname);
 
-    /* stop compression */
-    compressEnd(dsock);
+    /* free the list of events */
+    FreeList(dsock->events);
 
-    /* put the socket in the free_list */
-    dsock->next = dsock_free;
-    dsock_free  = dsock;
+    /* stop compression */
+    compressEnd(dsock, dsock->compressing, TRUE);
+
+    /* put the socket in the free stack */
+    PushStack(dsock, dsock_free);
   }
+  DetachIterator(&Iter);
 }

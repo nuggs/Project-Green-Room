@@ -22,19 +22,31 @@ time_t current_time;
  * I would never have known about the
  * va_ functions.
  */
-void log(const char *txt, ...)
+void log_string(const char *txt, ...)
 {
+  FILE *fp;
+  char logfile[MAX_BUFFER];
   char buf[MAX_BUFFER];
-  char *strtime;
+  char *strtime = get_time();
   va_list args;
 
   va_start(args, txt);
-  vsprintf(buf, txt, args);
+  vsnprintf(buf, MAX_BUFFER, txt, args);
   va_end(args);
 
-  strtime = get_time();
+  /* point to the correct logfile */
+  snprintf(logfile, MAX_BUFFER, "../log/%6.6s.log", strtime);
 
-  fprintf(stderr, "%s: %s\n", strtime, buf);
+  /* try to open logfile */
+  if ((fp = fopen(logfile, "a")) == NULL)
+  {
+    communicate(NULL, "log: cannot open logfile", COMM_LOG);
+    return;
+  }
+
+  fprintf(fp, "%s: %s\n", strtime, buf);
+  fclose(fp);
+
   communicate(NULL, buf, COMM_LOG);
 }
 
@@ -46,17 +58,25 @@ void log(const char *txt, ...)
  */
 void bug(const char *txt, ...)
 {
+  FILE *fp;
   char buf[MAX_BUFFER];
   va_list args;
-  char *strtime;
+  char *strtime = get_time();
 
   va_start(args, txt);
-  vsprintf(buf, txt, args);
+  vsnprintf(buf, MAX_BUFFER, txt, args);
   va_end(args);
 
-  strtime = get_time();
+  /* try to open logfile */
+  if ((fp = fopen("../log/bugs.txt", "a")) == NULL)
+  {
+    communicate(NULL, "bug: cannot open bugfile", COMM_LOG);
+    return;
+  }
 
-  fprintf(stderr, "%s: ***BUG*** %s ***BUG***\n", strtime, buf);
+  fprintf(fp, "%s: %s\n", strtime, buf);
+  fclose(fp);
+
   communicate(NULL, buf, COMM_LOG);
 }
 
@@ -66,11 +86,11 @@ void bug(const char *txt, ...)
  */
 time_t last_modified(char *helpfile)
 {
-  char fHelp[256];
+  char fHelp[MAX_BUFFER];
   struct stat sBuf;
   time_t mTime = 0;
 
-  sprintf(fHelp, "../help/%s", helpfile);
+  snprintf(fHelp, MAX_BUFFER, "../help/%s", helpfile);
   if (stat(fHelp, &sBuf) >= 0)
     mTime = sBuf.st_mtime;
 
@@ -81,11 +101,11 @@ char *read_help_entry(const char *helpfile)
 {
   FILE *fp;
   static char entry[MAX_HELP_ENTRY];
-  char fHelp[256];
+  char fHelp[MAX_BUFFER];
   int c, ptr = 0;
 
   /* location of the help file */
-  sprintf(fHelp, "../help/%s", helpfile);
+  snprintf(fHelp, MAX_BUFFER, "../help/%s", helpfile);
 
   /* if there is no help file, return NULL */
   if ((fp = fopen(fHelp, "r")) == NULL)
@@ -97,8 +117,10 @@ char *read_help_entry(const char *helpfile)
   /* read the file in the buffer */
   while (c != EOF)
   {
+    if (c == '\n')
+      entry[ptr++] = '\r';
     entry[ptr] = c;
-    if (++ptr > MAX_BUFFER - 1)
+    if (++ptr > MAX_HELP_ENTRY - 2)
     {
       bug("Read_help_entry: String to long.");
       abort();
@@ -106,6 +128,8 @@ char *read_help_entry(const char *helpfile)
     c = getc(fp);
   }
   entry[ptr] = '\0';
+
+  fclose(fp);
 
   /* return a pointer to the static buffer */
   return entry;
@@ -189,9 +213,10 @@ int fread_number(FILE *fp)
 
 /*
  * Reads one full block of text, which ends with a
- * '~' (tilde). The result will be copied into a
- * static buffer and a pointer to that buffer
- * will be returned.
+ * '~' (tilde). The result will be copied into an
+ * allocated buffer and a pointer to that buffer
+ * will be returned. Remember to free the memory when
+ * you are done using it.
  */
 char *fread_string(FILE *fp)
 {

@@ -9,36 +9,43 @@
 #include <pthread.h>
 #include <arpa/telnet.h>
 
-/***********************
- * Standard defintions *
- ***********************/
+#include "list.h"
+#include "stack.h"
+
+/************************
+ * Standard definitions *
+ ************************/
 
 /* define TRUE and FALSE */
 #ifndef FALSE
-#define FALSE 0
+#define FALSE   0
 #endif
 #ifndef TRUE
-#define TRUE 1
+#define TRUE    1
 #endif
 
-/* A few globals */
-#define MAX_BUFFER         1024                   /*  seems like a decent amount        */
-#define MAX_OUTPUT         2048                   /*  well shoot me if it isn't enough  */
-#define MAX_HELP_ENTRY     4096                   /*  roughly 40 lines of blocktext     */
-#define MUDPORT            9009                   /*  just set whatever port you want   */
-#define FILE_TERMINATOR    "EOF"                  /*  end of file marker                */
-#define COPYOVER_FILE      "../txt/copyover.dat"  /*  tempfile to store copyover data   */
-#define EXE_FILE           "../src/SocketMud"     /*  the name of the mud binary        */
+#define eTHIN   0
+#define eBOLD   1
 
-/* Connection States */
+/* A few globals */
+#define PULSES_PER_SECOND     4                   /* must divide 1000 : 4, 5 or 8 works */
+#define MAX_BUFFER         1024                   /* seems like a decent amount         */
+#define MAX_OUTPUT         2048                   /* well shoot me if it isn't enough   */
+#define MAX_HELP_ENTRY     4096                   /* roughly 40 lines of blocktext      */
+#define MUDPORT            9009                   /* just set whatever port you want    */
+#define FILE_TERMINATOR    "EOF"                  /* end of file marker                 */
+#define COPYOVER_FILE      "../txt/copyover.dat"  /* tempfile to store copyover data    */
+#define EXE_FILE           "../src/SocketMud"     /* the name of the mud binary         */
+
+/* Connection states */
 #define STATE_NEW_NAME         0
 #define STATE_NEW_PASSWORD     1
 #define STATE_VERIFY_PASSWORD  2
 #define STATE_ASK_PASSWORD     3
 #define STATE_PLAYING          4
-#define STATE_CLOSED           5  /* should always be the last state */
+#define STATE_CLOSED           5
 
-/* Thread States */
+/* Thread states - please do not change the order of these states    */
 #define TSTATE_LOOKUP          0  /* Socket is in host_lookup        */
 #define TSTATE_DONE            1  /* The lookup is done.             */
 #define TSTATE_WAIT            2  /* Closed while in thread.         */
@@ -71,7 +78,7 @@ typedef  short int         sh_int;
 #define IS_ADMIN(dMob)          ((dMob->level) > LEVEL_PLAYER ? TRUE : FALSE)
 #define IREAD(sKey, sPtr)             \
 {                                     \
-  if (compares(sKey, word))           \
+  if (!strcasecmp(sKey, word))        \
   {                                   \
     int sValue = fread_number(fp);    \
     sPtr = sValue;                    \
@@ -81,10 +88,9 @@ typedef  short int         sh_int;
 }
 #define SREAD(sKey, sPtr)             \
 {                                     \
-  if (compares(sKey, word))           \
+  if (!strcasecmp(sKey, word))        \
   {                                   \
-    char *sValue = fread_string(fp);  \
-    sPtr = strdup(sValue);            \
+    sPtr = fread_string(fp);          \
     found = TRUE;                     \
     break;                            \
   }                                   \
@@ -103,18 +109,18 @@ typedef struct  dSocket       D_SOCKET;
 typedef struct  dMobile       D_MOBILE;
 typedef struct  help_data     HELP_DATA;
 typedef struct  lookup_data   LOOKUP_DATA;
+typedef struct  event_data    EVENT_DATA;
 
 /* the actual structures */
 struct dSocket
 {
-  D_SOCKET      * next;
   D_MOBILE      * player;
+  LIST          * events;
   char          * hostname;
   char            inbuf[MAX_BUFFER];
   char            outbuf[MAX_OUTPUT];
   char            next_command[MAX_BUFFER];
   bool            bust_prompt;
-  sh_int          waitstate;
   sh_int          lookup_status;
   sh_int          state;
   sh_int          control;
@@ -126,8 +132,8 @@ struct dSocket
 
 struct dMobile
 {
-  D_MOBILE      * next;
   D_SOCKET      * socket;
+  LIST          * events;
   char          * name;
   char          * password;
   sh_int          level;
@@ -135,7 +141,6 @@ struct dMobile
 
 struct help_data
 {
-  HELP_DATA     * next;
   time_t          load_time;
   char          * keyword;
   char          * text;
@@ -161,6 +166,9 @@ typedef struct buffer_type
   int      size;        /* The allocated size of data    */
 } BUFFER;
 
+/* here we include external structure headers */
+#include "event.h"
+
 /******************************
  * End of new structures      *
  ******************************/
@@ -169,11 +177,11 @@ typedef struct buffer_type
  * Global Variables        *
  ***************************/
 
-extern  D_SOCKET    *   dsock_free;       /* the socket free list               */
-extern  D_SOCKET    *   dsock_list;       /* the linked list of active sockets  */
-extern  D_MOBILE    *   dmobile_free;     /* the mobile free list               */
-extern  D_MOBILE    *   dmobile_list;     /* the mobile list of active mobiles  */
-extern  HELP_DATA   *   help_list;        /* the linked list of help files      */
+extern  STACK       *   dsock_free;       /* the socket free list               */
+extern  LIST        *   dsock_list;       /* the linked list of active sockets  */
+extern  STACK       *   dmobile_free;     /* the mobile free list               */
+extern  LIST        *   dmobile_list;     /* the mobile list of active mobiles  */
+extern  LIST        *   help_list;        /* the linked list of help files      */
 extern  const struct    typCmd tabCmd[];  /* the command table                  */
 extern  bool            shut_down;        /* used for shutdown                  */
 extern  char        *   greeting;         /* the welcome greeting               */
@@ -238,7 +246,7 @@ void  handle_cmd_input        ( D_S *dsock, char *arg );
 /*
  * io.c
  */
-void    log                   ( const char *txt, ... );
+void    log_string            ( const char *txt, ... );
 void    bug                   ( const char *txt, ... );
 time_t  last_modified         ( char *helpfile );
 char   *read_help_entry       ( const char *helpfile );     /* pointer         */
@@ -251,7 +259,8 @@ int     fread_number          ( FILE *fp );                 /* just an integer *
  * strings.c
  */
 char   *one_arg               ( char *fStr, char *bStr );
-bool    compares              ( const char *aStr, const char *bStr );
+char   *strdup                ( const char *s );
+int     strcasecmp            ( const char *s1, const char *s2 );
 bool    is_prefix             ( const char *aStr, const char *bStr );
 char   *capitalize            ( char *txt );
 BUFFER *__buffer_new          ( int size );
@@ -259,11 +268,6 @@ void    __buffer_strcat       ( BUFFER *buffer, const char *text );
 void    buffer_free           ( BUFFER *buffer );
 void    buffer_clear          ( BUFFER *buffer );
 int     bprintf               ( BUFFER *buffer, char *fmt, ... );
-
-/*
- * update.c
- */
-void  update_handler          ( void );
 
 /*
  * help.c
@@ -277,7 +281,6 @@ void  load_helps              ( void );
 bool  check_name              ( const char *name );
 void  clear_mobile            ( D_M *dMob );
 void  free_mobile             ( D_M *dMob );
-void  ex_free_mob             ( D_MOBILE * dMob );
 void  communicate             ( D_M *dMob, char *txt, int range );
 void  load_muddata            ( bool fCopyOver );
 char *get_time                ( void );
@@ -302,7 +305,7 @@ void  cmd_linkdead            ( D_M *dMob, char *arg );
  * mccp.c
  */
 bool  compressStart           ( D_S *dsock, unsigned char teleopt );
-bool  compressEnd             ( D_S *dsock );
+bool  compressEnd             ( D_S *dsock, unsigned char teleopt, bool forced );
 
 /*
  * save.c
@@ -315,4 +318,4 @@ D_M  *load_profile            ( char *player );
  * End of prototype declartion *
  *******************************/
 
-#endif  // MUD_H
+#endif  /* MUD_H */

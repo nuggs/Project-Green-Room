@@ -11,13 +11,14 @@
 #include <ctype.h>
 #include <stdio.h>
 #include <time.h>
+#include <dirent.h> 
 
 /* include main header file */
 #include "mud.h"
 
-HELP_DATA   *   help_list;        /* the linked list of help files     */
-char        *   greeting;         /* the welcome greeting              */
-char        *   motd;             /* the MOTD help file                */
+LIST     *  help_list = NULL;   /* the linked list of help files     */
+char     *  greeting;           /* the welcome greeting              */
+char     *  motd;               /* the MOTD help file                */
 
 /*
  * Check_help()
@@ -35,13 +36,15 @@ char        *   motd;             /* the MOTD help file                */
 bool check_help(D_MOBILE *dMob, char *helpfile)
 {
   HELP_DATA *pHelp;
+  ITERATOR Iter;
   char buf[MAX_HELP_ENTRY + 80];
   char *entry, *hFile;
   bool found = FALSE;
 
   hFile = capitalize(helpfile);
 
-  for (pHelp = help_list; pHelp; pHelp = pHelp->next)
+  AttachIterator(&Iter, help_list);
+  while ((pHelp = (HELP_DATA *) NextInList(&Iter)) != NULL)
   {
     if (is_prefix(helpfile, pHelp->keyword))
     {
@@ -49,6 +52,7 @@ bool check_help(D_MOBILE *dMob, char *helpfile)
       break;
     }
   }
+  DetachIterator(&Iter);
 
   /* If there is an updated version we load it */
   if (found)
@@ -61,6 +65,10 @@ bool check_help(D_MOBILE *dMob, char *helpfile)
   }
   else /* is there a version at all ?? */
   {
+    /* helpfiles do not contain double dots (no moving out of the helpdir) */
+    if (strstr(hFile, "..") != NULL)
+      return FALSE;
+
     if ((entry = read_help_entry(hFile)) == NULL)
       return FALSE;
     else
@@ -72,48 +80,62 @@ bool check_help(D_MOBILE *dMob, char *helpfile)
       }
       pHelp->keyword    =  strdup(hFile);
       pHelp->text       =  strdup(entry);
-      pHelp->next       =  help_list;
       pHelp->load_time  =  time(NULL);
-      help_list         =  pHelp;
+      AttachToList(pHelp, help_list);
     }
   }
 
-  sprintf(buf, "=== %s ===\n\r%s", pHelp->keyword, pHelp->text);
+  snprintf(buf, MAX_HELP_ENTRY + 80, "=== %s ===\n\r%s", pHelp->keyword, pHelp->text);
   text_to_mobile(dMob, buf);
+
   return TRUE;
 }
 
 /*
- * Loads all the helpfiles listed in ../help/help.lst
+ * Loads all the helpfiles found in ../help/
  */
 void load_helps()
 {
   HELP_DATA *new_help;
-  FILE *fp;
-  char *hFile;
+  char buf[MAX_BUFFER];
+  char *s;
+  DIR *directory;
+  struct dirent *entry;
 
-  /* check to see if there is a list of help files */
-  if ((fp = fopen("../help/help.lst", "r")) == NULL)
-    return;
+  log_string("Load_helps: getting all help files.");
 
-  log("Load_helps: getting all help files.");
+  help_list = AllocList();
 
-  while ((hFile = fread_line(fp)) != NULL)
+  directory = opendir("../help/");
+  for (entry = readdir(directory); entry; entry = readdir(directory))
   {
+    if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, ".."))
+      continue;
+
+    snprintf(buf, MAX_BUFFER, "../help/%s", entry->d_name);
+    s = read_help_entry(buf);
+
+    if (s == NULL)
+    {
+      bug("load_helps: Helpfile %s does not exist.", buf);
+      continue;
+    }
+
     if ((new_help = malloc(sizeof(*new_help))) == NULL)
     {
       bug("Load_helps: Cannot allocate memory.");
       abort();
     }
-    new_help->keyword    =  strdup(hFile);
-    new_help->text       =  strdup(read_help_entry(hFile));
-    new_help->load_time  =  time(NULL);
-    new_help->next       =  help_list;
-    help_list            =  new_help;
 
-    if (compares("GREETING", new_help->keyword))
+    new_help->keyword    =  strdup(entry->d_name);
+    new_help->text       =  strdup(s);
+    new_help->load_time  =  time(NULL);
+    AttachToList(new_help, help_list);
+
+    if (!strcasecmp("GREETING", new_help->keyword))
       greeting = new_help->text;
-    else if (compares("MOTD", new_help->keyword))
+    else if (!strcasecmp("MOTD", new_help->keyword))
       motd = new_help->text;
   }
+  closedir(directory);
 }
